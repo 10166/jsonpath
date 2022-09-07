@@ -29,6 +29,7 @@ package jsonpath
 import (
 	"errors"
 	"fmt"
+	"reflect"
 	"sort"
 	"strconv"
 	"strings"
@@ -192,17 +193,19 @@ func (p *parser) parseObjAccess() error {
 func (p *parser) prepareWildcard() error {
 	p.add(func(r, c interface{}, a actions) (interface{}, error) {
 		values := searchResults{}
-		if obj, ok := c.(map[string]interface{}); ok {
-			for _, v := range valuesSortedByKey(obj) {
-				v, err := a.next(r, v)
+		ct := reflect.ValueOf(c)
+		switch ct.Kind() {
+		case reflect.Slice, reflect.Array:
+			for i := 0; i < ct.Len(); i++ {
+				v, err := a.next(r, ct.Index(i).Interface())
 				if err != nil {
 					continue
 				}
 				values = values.append(v)
 			}
-		} else if array, ok := c.([]interface{}); ok {
-			for _, v := range array {
-				v, err := a.next(r, v)
+		case reflect.Map:
+			for _, k := range sortKey(ct.MapKeys()) {
+				v, err := a.next(r, ct.MapIndex(k).Interface())
 				if err != nil {
 					continue
 				}
@@ -370,13 +373,15 @@ func recSearchParent(r, c interface{}, a actions, acc searchResults) searchResul
 }
 
 func recSearchChildren(r, c interface{}, a actions, acc searchResults) searchResults {
-	if obj, ok := c.(map[string]interface{}); ok {
-		for _, c := range valuesSortedByKey(obj) {
-			acc = recSearchParent(r, c, a, acc)
+	ct := reflect.ValueOf(c)
+	switch ct.Kind() {
+	case reflect.Slice, reflect.Array:
+		for i := 0; i < ct.Len(); i++ {
+			acc = recSearchParent(r, ct.Index(i).Interface(), a, acc)
 		}
-	} else if array, ok := c.([]interface{}); ok {
-		for _, c := range array {
-			acc = recSearchParent(r, c, a, acc)
+	case reflect.Map:
+		for _, k := range sortKey(ct.MapKeys()) {
+			acc = recSearchParent(r, ct.MapIndex(k).Interface(), a, acc)
 		}
 	}
 	return acc
@@ -384,33 +389,37 @@ func recSearchChildren(r, c interface{}, a actions, acc searchResults) searchRes
 
 func prepareIndex(index interface{}, column int) actionFunc {
 	return func(r, c interface{}, a actions) (interface{}, error) {
-		if obj, ok := c.(map[string]interface{}); ok {
-			key, err := indexAsString(index, r, c)
-			if err != nil {
-				return nil, err
-			}
-			if c, ok = obj[key]; !ok {
-				return nil, fmt.Errorf("no key '%s' for object at %d", key, column)
-			}
-			return a.next(r, c)
-		} else if array, ok := c.([]interface{}); ok {
+		ct := reflect.ValueOf(c)
+		switch ct.Kind() {
+		case reflect.Slice, reflect.Array:
 			index, err := indexAsInt(index, r, c)
 			if err != nil {
 				return nil, err
 			}
-			if index < 0 || index >= len(array) {
+			if index < 0 || index >= ct.Len() {
 				return nil, fmt.Errorf("out of bound array access at %d", column)
 			}
-			return a.next(r, array[index])
+			return a.next(r, ct.Index(index).Interface())
+		case reflect.Map:
+			key, err := indexAsString(index, r, c)
+			if err != nil {
+				return nil, err
+			}
+			value := ct.MapIndex(reflect.ValueOf(key))
+			if !value.IsValid() {
+				return nil, fmt.Errorf("no key '%s' for object at %d", key, column)
+			}
+			return a.next(r, value.Interface())
 		}
+
 		return nil, fmt.Errorf("expected array or object at %d", column)
 	}
 }
 
 func prepareSlice(indexes []interface{}, column int) actionFunc {
 	return func(r, c interface{}, a actions) (interface{}, error) {
-		array, ok := c.([]interface{})
-		if !ok {
+		ct := reflect.ValueOf(c)
+		if ct.Kind() != reflect.Array && ct.Kind() != reflect.Slice {
 			return nil, fmt.Errorf("expected JSON array at %d", column)
 		}
 		var err error
@@ -426,7 +435,7 @@ func prepareSlice(indexes []interface{}, column int) actionFunc {
 				return nil, err
 			}
 		}
-		max := len(array)
+		max := ct.Len()
 		start = negmax(start, max)
 		if end == 0 {
 			end = max
@@ -442,7 +451,7 @@ func prepareSlice(indexes []interface{}, column int) actionFunc {
 		var values searchResults
 		if step > 0 {
 			for i := start; i < end; i += step {
-				v, err := a.next(r, array[i])
+				v, err := a.next(r, ct.Index(i).Interface())
 				if err != nil {
 					continue
 				}
@@ -450,7 +459,7 @@ func prepareSlice(indexes []interface{}, column int) actionFunc {
 			}
 		} else { // reverse order on negative step
 			for i := end - 1; i >= start; i += step {
-				v, err := a.next(r, array[i])
+				v, err := a.next(r, ct.Index(i).Interface())
 				if err != nil {
 					continue
 				}
@@ -552,18 +561,37 @@ func indexAsString(key, r, c interface{}) (string, error) {
 	}
 }
 
-func valuesSortedByKey(m map[string]interface{}) []interface{} {
+func sortKey(m []reflect.Value) []reflect.Value {
 	if len(m) == 0 {
 		return nil
 	}
-	keys := make([]string, 0, len(m))
-	for k := range m {
-		keys = append(keys, k)
+	keys := make([]reflect.Value, 0, len(m))
+	for _, v := range m {
+		keys = append(keys, v)
 	}
-	sort.Strings(keys)
-	values := make([]interface{}, 0, len(m))
-	for _, k := range keys {
-		values = append(values, m[k])
-	}
-	return values
+	sort.Slice(keys, func(i, j int) bool {
+		return keys[i].String() < keys[j].String()
+	})
+	return keys
+	//for _, k := range m {
+	//	keys = append(keys, k.String())
+	//}
+	//sort.Strings(keys)
+	//return keys
 }
+
+//func valuesSortedByKey(m map[string]interface{}) []interface{} {
+//	if len(m) == 0 {
+//		return nil
+//	}
+//	keys := make([]string, 0, len(m))
+//	for k := range m {
+//		keys = append(keys, k)
+//	}
+//	sort.Strings(keys)
+//	values := make([]interface{}, 0, len(m))
+//	for _, k := range keys {
+//		values = append(values, m[k])
+//	}
+//	return values
+//}
